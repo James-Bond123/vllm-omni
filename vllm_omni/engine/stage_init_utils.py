@@ -1041,14 +1041,17 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
             return
 
     previous_env: dict[str, str | None] = {}
-    for key, value in runtime_env.items():
-        env_key = str(key)
-        previous_env[env_key] = os.environ.get(env_key)
-        os.environ[env_key] = str(value)
-
-    if previous_env:
-        logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
     try:
+        for key, value in runtime_env.items():
+            env_key = str(key)
+            old_value = os.environ.get(env_key)
+            os.environ[env_key] = str(value)
+            # Track only successful writes, preserving the original value
+            # if distinct keys normalize to the same environment name.
+            previous_env.setdefault(env_key, old_value)
+
+        if previous_env:
+            logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
         yield
     finally:
         for key, old_value in previous_env.items():
@@ -1107,7 +1110,7 @@ def _project_omni_stage_engine_args(
         "default_sampling_params",
         "has_sampling_extra_args",
     }
-    runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus"}
+    runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus", "cuda_mps"}
     if not is_diffusion:
         # These values configure OmniDiffusionConfig or its worker process;
         # OmniEngineArgs has no matching fields for LLM stages.
@@ -1189,6 +1192,8 @@ def _project_omni_stage_engine_args(
     engine_args["async_chunk"] = connector_config.async_chunk
     if connector_config.omni_kv_config is not None:
         engine_args["omni_kv_config"] = copy.deepcopy(connector_config.omni_kv_config)
+    if connector_config.kv_transfer_config is not None:
+        engine_args["kv_transfer_config"] = copy.deepcopy(connector_config.kv_transfer_config)
 
     if is_diffusion:
         engine_args["parallel_config"] = _project_omni_config_fields(
@@ -1753,9 +1758,13 @@ def acquire_device_locks(
     engine_args_dict: dict[str, Any],
     stage_init_timeout: int,
     locked_devices: set[int] | None = None,
+    *,
+    visible_devices: str | None = None,
 ) -> list[int]:
     """Acquire exclusive file locks on devices needed by this stage.
 
+    Pass resolved physical ``visible_devices`` to avoid changing the process
+    environment while waiting. When omitted, use the device-control environment.
     Returns list of lock file descriptors that must be released after init.
     """
     lock_fds: list[int] = []
@@ -1788,7 +1797,7 @@ def acquire_device_locks(
 
         # Get physical device IDs
         device_control_env = current_omni_platform.device_control_env_var
-        visible_devices_str = os.environ.get(device_control_env)
+        visible_devices_str = visible_devices if visible_devices is not None else os.environ.get(device_control_env)
         physical_devices: list[int] = []
 
         if visible_devices_str:
@@ -1980,6 +1989,15 @@ def build_diffusion_config(
     )
     od_config = OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
 
+    for dimension in ("height", "width"):
+        value = getattr(metadata.default_sampling_params, dimension, None)
+        if isinstance(value, int) and value > 0:
+            od_config.additional_config.setdefault(f"diffusion_kv_profile_{dimension}", value)
+
+    if od_config.distributed_executor_backend == "ray":
+        runtime_env = _to_dict(_get_attr_or_item(metadata.runtime_cfg, "env", {}) or {})
+        od_config.ray_worker_env = {str(key): str(value) for key, value in runtime_env.items()}
+
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var
     visible_devices_str = os.environ.get(device_control_env) if device_control_env else None
@@ -1989,7 +2007,10 @@ def build_diffusion_config(
     else:
         physical_devices = list(range(current_omni_platform.get_device_count()))
 
-    if len(physical_devices) < num_devices_per_stage:
+    # Ray validates cluster-wide GPU availability through its placement
+    # group. The stage driver only sees the GPUs on its own node, so a local
+    # device-count check would reject every valid multi-node configuration.
+    if od_config.distributed_executor_backend != "ray" and len(physical_devices) < num_devices_per_stage:
         raise ValueError(
             f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
             f"but {len(physical_devices)} device(s) are available: {physical_devices}"

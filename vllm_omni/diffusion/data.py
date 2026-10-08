@@ -16,7 +16,7 @@ import diffusers
 import huggingface_hub
 import torch
 from PIL import Image
-from pydantic import Field, model_validator
+from pydantic import model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -43,6 +43,9 @@ if TYPE_CHECKING:
 # The actual import is deferred to __post_init__ to avoid import order issues
 
 logger = init_logger(__name__)
+
+# Accepted values for ``OmniDiffusionConfig.vae_fast_path``.
+VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
 
 
 def _move_diffusion_alias(
@@ -314,6 +317,8 @@ class DiffusionParallelConfig:
 
     - "tile": Patch/tile parallel decode (default). Each rank decodes a subset
       of spatial tiles and the results are stitched on rank 0.
+    - "batch": Decode complete images on different ranks, preserving their
+      batch order. Requires AutoencoderKL/Flux2 and DP/PP/CFG sizes of 1.
     - "spatial_shard_height": Spatially-sharded decode that splits decoder
       feature maps along height and exchanges halo rows around spatial
       convolutions.
@@ -354,10 +359,14 @@ class DiffusionParallelConfig:
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
-        assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
-            "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
+        assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
+            "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
         )
+        if self.vae_parallel_mode == "batch" and (
+            self.data_parallel_size not in (None, 1) or self.pipeline_parallel_size != 1 or self.cfg_parallel_size != 1
+        ):
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
         if self.allgather_degree > 1:
             assert self.ulysses_degree == 1 and self.ring_degree == 1, (
                 "AllGather-KV (allgather_degree>1) is mutually exclusive with Ulysses/Ring in v1. "
@@ -475,6 +484,8 @@ class DiffusionParallelConfig:
         if world_size % non_dp_size != 0:
             raise ValueError(f"WORLD size ({world_size}) must be divisible by non-DP parallel size ({non_dp_size})")
         inferred_data_parallel_size = world_size // non_dp_size
+        if self.vae_parallel_mode == "batch" and inferred_data_parallel_size != 1:
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
         if self.data_parallel_size is not None and self.data_parallel_size != inferred_data_parallel_size:
             raise ValueError(
                 f"data_parallel_size ({self.data_parallel_size}) does not match WORLD-derived value "
@@ -804,10 +815,16 @@ def uses_diffusers_adapter(od_config: object) -> bool:
 @dataclass
 class VideoOutputTransportConfig:
     enable_device_postprocess: bool = False
+    enable_registered_shm: bool = False
+    enable_borrowed_frames: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.enable_device_postprocess, bool):
             raise TypeError("enable_device_postprocess must be a bool")
+        if not isinstance(self.enable_registered_shm, bool):
+            raise TypeError("enable_registered_shm must be a bool")
+        if not isinstance(self.enable_borrowed_frames, bool):
+            raise TypeError("enable_borrowed_frames must be a bool")
 
 
 @dataclass
@@ -843,7 +860,7 @@ class OmniDiffusionConfig:
     parallel_config: DiffusionParallelConfig = field(default_factory=DiffusionParallelConfig)
 
     # Cache backend configuration (NEW)
-    cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
+    cache_backend: str | None = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
     video_output_transport: VideoOutputTransportConfig = field(default_factory=VideoOutputTransportConfig)
     enable_cache_dit_summary: bool = False
@@ -880,6 +897,9 @@ class OmniDiffusionConfig:
 
     # Local Diffusion KV ownership and cache-layout mode.
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+    # Reuse block-aligned, immutable diffusion prefixes across requests when
+    # Scheduler-owned paged KV is active.
+    enable_prefix_caching: bool = False
     # Maximum number of native BlockTable rows one public request can own
     # (sequences plus independent contexts). The model adapter defines it.
     diffusion_kv_max_rows_per_request: int | None = None
@@ -944,6 +964,12 @@ class OmniDiffusionConfig:
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    # Wan VAE decoder fast path. ``"lossless"`` installs the bit-exact fused
+    # kernels on every diffusers Wan VAE, ``"channels_last"`` additionally
+    # converts decoder convolution weights to channels-last memory format and
+    # fuses RMSNorm+SiLU (faster, not bit-exact), ``"off"`` keeps the reference
+    # diffusers implementation.
+    vae_fast_path: str = "lossless"
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -955,6 +981,19 @@ class OmniDiffusionConfig:
 
     # Compilation
     enforce_eager: bool = False
+    # Capture fixed-shape KV-cache decode (denoising) steps into CUDA graphs.
+    # Currently only Qwen-Image-2.1's transformer implements this; other models
+    # ignore the flag. This is a per-model diffusion path, independent of the
+    # AR engine's ``compilation_config.cudagraph_mode`` (which does not apply
+    # to diffusion stages). It stacks with ``diffusion_compile_granularity``:
+    # the DiT blocks are still torch.compile'd and graph capture records the
+    # compiled (fused) kernels, while inductor's own cudagraphs stay off.
+    # ``enforce_eager=True`` forces eager decode and
+    # disables capture regardless of this flag; unsupported configurations
+    # (SP/TP, ring, HSDP, dynamic LoRA, padded masks, quantized prefix KV, or
+    # a second in-flight request aliasing the same graph key) log and fall
+    # back to eager decode.
+    enable_cuda_graph_decode: bool = True
     # Controls the generic compilation path used when a pipeline does not
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
@@ -964,6 +1003,9 @@ class OmniDiffusionConfig:
     enable_multithread_weight_load: bool = True
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
+
+    # Shard meta parameters before reading rank-local HF safetensors slices.
+    hsdp_weight_load_strategy: str = "full"
 
     # Enable sleep mode
     enable_sleep_mode: bool = False
@@ -983,6 +1025,9 @@ class OmniDiffusionConfig:
 
     # Worker extension class for custom functionality
     worker_extension_cls: str | None = None
+
+    # Internal transport of explicit stage runtime.env to remote Ray actors.
+    ray_worker_env: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     # Custom pipeline arguments for custom pipelines
     custom_pipeline_args: dict[str, Any] | None = None
@@ -1051,6 +1096,15 @@ class OmniDiffusionConfig:
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
 
+    # Conditioning keys fetched from the upstream stage over the omni connector
+    # rather than carried inline through the orchestrator. Empty disables the
+    # worker-side connector receive path.
+    stage_input_payload_keys: tuple[str, ...] = ()
+
+    # Keys handed to the next stage over the omni connector. Empty disables the
+    # worker-side connector send path.
+    stage_output_payload_keys: tuple[str, ...] = ()
+
     # Quantization: str method name, dict config, QuantizationConfig, or None.
     # str is resolved to {"method": <str>} internally.
     # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
@@ -1099,7 +1153,7 @@ class OmniDiffusionConfig:
     request_batch_max_wait_ms: float = 0.0
 
     # Supplementary model specific parameters
-    extras: dict[str, Any] = Field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_moe(self) -> bool:
@@ -1169,11 +1223,19 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
+            raise ValueError(
+                f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"
+            )
         from vllm_omni.diffusion.offloader.config import (
             OffloadStrategy,
             materialize_legacy_offload_flags,
         )
 
+        self.stage_input_payload_keys = tuple(self.stage_input_payload_keys)
+        self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
+        if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
+            raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
@@ -1182,6 +1244,19 @@ class OmniDiffusionConfig:
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if not isinstance(self.enable_prefix_caching, bool):
+            raise TypeError("enable_prefix_caching must be a bool")
+        if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            raise ValueError(
+                "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
+                "set diffusion_kv_mode='paged_scheduler' or disable enable_prefix_caching"
+            )
+        if self.enable_prefix_caching and self.enable_sleep_mode:
+            raise ValueError(
+                "Diffusion prefix caching cannot be combined with sleep mode: "
+                "sleep discards KV pages without invalidating cached prefixes; "
+                "disable enable_prefix_caching or enable_sleep_mode"
+            )
         if self.diffusion_kv_max_rows_per_request is not None and (
             type(self.diffusion_kv_max_rows_per_request) is not int or self.diffusion_kv_max_rows_per_request <= 0
         ):
@@ -1225,6 +1300,13 @@ class OmniDiffusionConfig:
             if self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
                 raise ValueError("native kv_transfer_config requires diffusion_kv_mode='paged_scheduler'")
             self.kv_transfer_config = parse_kv_transfer_config(self.kv_transfer_config)
+            if self.enable_prefix_caching and self.kv_transfer_config is not None:
+                raise ValueError(
+                    "Diffusion prefix caching cannot be combined with native kv_transfer_config; "
+                    "disable enable_prefix_caching for AR KV import or remove kv_transfer_config for local DiT reuse"
+                )
+            if self.enable_sleep_mode:
+                raise ValueError("Native KV transfer does not support sleep mode: registered pages must remain mapped")
 
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
@@ -1463,6 +1545,29 @@ class OmniDiffusionConfig:
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
         self.supports_mixed_reference_inputs = metadata.supports_mixed_reference_inputs
 
+    def _load_component_transformer_config(self) -> bool:
+        """Load a registered pipeline's component-level DiT configuration."""
+        from vllm.transformers_utils.config import get_hf_file_to_dict
+
+        from vllm_omni.model_extras import get_transformer_config_subfolder
+
+        transformer_subfolder = get_transformer_config_subfolder(
+            self.model_class_name,
+            model=self.model,
+            revision=self.revision,
+        )
+        tf_config_dict = get_hf_file_to_dict(
+            f"{transformer_subfolder}/config.json",
+            self.model,
+            revision=self.revision,
+        )
+        if tf_config_dict is None:
+            tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model, revision=self.revision)
+        if tf_config_dict is None:
+            return False
+        self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
+        return True
+
     @staticmethod
     def _looks_like_lance_subfolder(model: str | None) -> bool:
         """Return True when ``--model`` points at a Lance per-component subfolder.
@@ -1529,23 +1634,7 @@ class OmniDiffusionConfig:
                             exc,
                         )
                 else:
-                    from vllm_omni.model_extras import get_transformer_config_subfolder
-
-                    transformer_subfolder = get_transformer_config_subfolder(
-                        self.model_class_name,
-                        model=self.model,
-                        revision=self.revision,
-                    )
-                    tf_config_dict = get_hf_file_to_dict(
-                        f"{transformer_subfolder}/config.json",
-                        self.model,
-                        revision=self.revision,
-                    )
-                    if tf_config_dict is None:
-                        tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model, revision=self.revision)
-                    if tf_config_dict is not None:
-                        self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
-                    else:
+                    if not self._load_component_transformer_config():
                         self.set_tf_model_config(TransformerConfig())
             else:
                 raise FileNotFoundError("Diffusers pipeline index not found")
@@ -1579,6 +1668,23 @@ class OmniDiffusionConfig:
                     if self._looks_like_lance_subfolder(self.model):
                         self.model_class_name = "LancePipeline"
                         self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                        return
+                    # An explicit topology or CLI override can select a native,
+                    # registered pipeline whose repository contains component
+                    # configs but no root HF config or Diffusers index. Trust
+                    # that explicit class selection only when its component
+                    # transformer config is present.
+                    from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+                    if (
+                        self.model_class_name in DiffusionModelRegistry.get_supported_archs()
+                        and self._load_component_transformer_config()
+                    ):
+                        logger.info(
+                            "Using explicitly selected diffusion pipeline %r with component-level configuration.",
+                            self.model_class_name,
+                        )
                         self.update_multimodal_support()
                         return
                     raise ValueError(f"Could not find config.json or a Diffusers pipeline index for {self.model}")
@@ -1674,6 +1780,7 @@ class OmniDiffusionConfig:
                         or DiffusionModelRegistry._try_load_model_cls(architecture) is not None
                     ):
                         self.model_class_name = architecture
+                    self.update_multimodal_support()
                 else:
                     raise
 
@@ -1756,10 +1863,15 @@ class DiffusionOutput:
     # Internal control-plane event emitted on first scheduler admission.
     request_started: bool = False
 
-    # Typed video-media contract. Declared last so the pre-existing positional
+    # Typed video-media contract. Appended so the pre-existing positional
     # constructor order (output, trajectory_timesteps, ...) that out-of-tree
     # pipelines rely on is preserved. Mutually exclusive with ``output``.
     media: DiffusionMediaOutput | None = None
+
+    # Compatibility adapter for joint (video, audio) outputs that have not
+    # migrated to typed media. Only this tuple entry is eligible for video
+    # transport optimizations; unmarked legacy outputs retain their old path.
+    video_output_index: int | None = None
 
     def __post_init__(self) -> None:
         if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):
@@ -2191,7 +2303,7 @@ def build_attention_config(
 
     Called exactly once in ``OmniDiffusionConfig.__post_init__``.
     Handles type-conversion **and** env-var fallback
-    (``DIFFUSION_ATTENTION_BACKEND``).
+    (``DIFFUSION_ATTENTION_BACKEND`` and ``DIFFUSION_ATTENTION_QUANT``).
     """
     normalized = parse_attention_config(attention_config)
 
@@ -2205,7 +2317,30 @@ def build_attention_config(
     if env_attention_backend.lower() == "auto":
         return normalized
 
-    normalized.default = AttentionSpec(backend=env_attention_backend)
+    # If config file doesn't explicitly setup quantization specs, optionally set
+    # from the env-var.
+    quant = None
+    env_attention_quant = os.environ.get("DIFFUSION_ATTENTION_QUANT")
+    if env_attention_quant is not None:
+        fields = [field.strip() for field in env_attention_quant.split(":")]
+        if len(fields) not in (2, 4) or not all(fields):
+            raise ValueError(
+                "DIFFUSION_ATTENTION_QUANT must have the format <dtype_qk>:<dtype_vo>[:<q_block_size>:<k_block_size>]."
+            )
+        quant_kwargs: dict[str, Any] = {
+            "dtype_qk": fields[0],
+            "dtype_vo": fields[1],
+        }
+        if len(fields) == 4:
+            q_block_size, k_block_size = int(fields[2]), int(fields[3])
+            if (q_block_size, k_block_size) != (0, 0):
+                quant_kwargs.update(
+                    q_block_size=q_block_size,
+                    k_block_size=k_block_size,
+                )
+        quant = AttnQuantSpec(**quant_kwargs)
+
+    normalized.default = AttentionSpec(backend=env_attention_backend, quant=quant)
     logger.info(
         "Parsed attention config from DIFFUSION_ATTENTION_BACKEND '%s': default=%s, per_role=%s",
         env_attention_backend,

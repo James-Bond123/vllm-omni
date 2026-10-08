@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import AbstractContextManager
 from functools import partial
 from typing import Any
 
@@ -23,6 +24,7 @@ from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu._310p import is_310p
+from vllm_omni.platforms.npu.worker.aux_output import NPUAuxOutputMixin
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 logger = init_logger(__name__)
@@ -34,10 +36,15 @@ else:
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
-class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
-    def initialize_kv_cache(self, kv_cache_config) -> None:
+class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
+    def initialize_kv_cache(
+        self, kv_cache_config, kv_cache_allocation_context: AbstractContextManager | None = None
+    ) -> None:
         """Stage the omni prefix-cache config (hidden / mm tensors reused on hits)."""
-        NPUModelRunner.initialize_kv_cache(self, kv_cache_config)
+        NPUModelRunner.initialize_kv_cache(
+            self, kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context
+        )
+        self._init_omni_aux_output(kv_cache_config)
         if getattr(self, "_omni_prefix_cache_cfg", None) is None:
             # Same gate as the GPU runner (pooling stage, kv_consumer /
             # kv_both, hybrid kv groups). Read the config back off
@@ -332,8 +339,6 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
 
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
-            elif self.uses_xdrope_dim > 0:
-                positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
                 positions = self.positions[:num_tokens_padded]
 

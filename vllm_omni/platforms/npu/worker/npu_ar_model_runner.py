@@ -54,7 +54,7 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
 )
-from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
+from vllm_omni.worker.sampling_utils import call_model_sampler, sanitize_min_tokens_stop_ids
 
 
 def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
@@ -315,10 +315,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | IntermediateTensors | None:
-        if self.vllm_config.model_config.enable_return_routed_experts:
-            capturer = self.routed_experts_capturer
-            if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
-                capturer.finalize_pending_copy()
         profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
         if profiling_chunk_config.enabled and profiling_chunk_config.need_timing:
             if getattr(scheduler_output, "disable_profiling_timing", False):
@@ -392,6 +388,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
         #  -------------------------------------- Omni-new -------------------------------------------------
 
+        self._begin_omni_aux_output_step(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
@@ -544,7 +541,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         self.input_batch,
                         self.requests,
                         self.compilation_config.static_forward_context,
-                        self.model.get_mamba_state_copy_func(),
+                        self._get_mamba_state_copy_funcs(),
                         preprocess_bufs,
                     )
                     # preprocess_mamba resets num_accepted_tokens_cpu to 1
@@ -791,9 +788,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
-        if self.vllm_config.model_config.enable_return_routed_experts and hasattr(self, "_positions_cpu"):
-            self._omni_routed_experts_d2h(scheduler_output)
-
         return None
 
     def _sample(
@@ -818,7 +812,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     )
                 prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
                 self._apply_duplex_sampling(logits, prepared_sampling_metadata)
-                sampler_output = model_sample(logits, prepared_sampling_metadata)
+                sampler_output = call_model_sampler(
+                    self.model,
+                    model_sample,
+                    logits,
+                    prepared_sampling_metadata,
+                    input_batch=self.input_batch,
+                    requests=getattr(self, "requests", None),
+                )
                 if sampler_output is not None:
                     return sampler_output
             return self.sampler(
@@ -877,6 +878,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             multimodal_outputs, # Omni-Specific
             prefix_cache_step_id,
         ) = self.execute_model_state
+        pending_aux_output = self._prepare_omni_aux_output()
         # Clear ephemeral state.
         self.execute_model_state = None
         hidden_seq_len = int(hidden_states.shape[0])
@@ -1008,11 +1010,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     draft_by_req_id = dict(zip(draft_req_ids, draft_ids_list))
                     output_spec_token_ids = [draft_by_req_id.get(req_id, []) for req_id in req_ids_output_copy]
 
-        routed_experts_lists = None
-        if self.model_config.enable_return_routed_experts:
-            capturer = self.routed_experts_capturer
-            if capturer is not None and hasattr(self.input_batch, "num_tokens_no_spec"):
-                routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
+        aux_output = self._finish_omni_aux_output(
+            pending_aux_output, scheduler_output, sampler_output.sampled_token_ids, invalid_req_indices
+        )
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
@@ -1202,7 +1202,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             num_nans_in_logits=num_nans_in_logits,
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids
-        model_runner_output.routed_experts = routed_experts_lists
+        model_runner_output.aux_output_connector_output = aux_output
         model_runner_output.spec_token_ids = output_spec_token_ids
         with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):
             model_runner_output.omni_connector_output = self.get_omni_connector_output()
